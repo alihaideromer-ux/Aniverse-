@@ -370,7 +370,7 @@ function norm(m) {
 let queue = Promise.resolve();
 let lastError = '';
 let lastReq = 0;
-const GAP = 900;   // minimum ms between requests (AniList allows ~90/min and sometimes only 30/min). The first request is not delayed.
+const GAP = 2200;   // minimum ms between requests (AniList allows ~90/min and sometimes only 30/min). The first request is not delayed.
 let coolUntil = 0; // after a rate limit / blocked request every queued request waits until this time
 // --- response cache: survives refresh, so the site keeps working while AniList is throttling us
 const AQ_TTL = 15 * 60 * 1000, AQ_STALE = 7 * 24 * 3600 * 1000;
@@ -385,7 +385,8 @@ function aqSet(k, d) {
     localStorage.setItem(k, val);
   } catch (_) {}
 }
-function gql(query, variables = {}) {
+let fgPending = 0;
+function gql(query, variables = {}, bg = false) {
   const key = aqKey(query, variables), hit = aqGet(key);
   if (hit && Date.now() - hit.t < AQ_TTL) return Promise.resolve(hit.d);   // fresh cache: no network at all
   const run = async () => {
@@ -424,8 +425,13 @@ function gql(query, variables = {}) {
     lastError = lastErr;
     throw new Error(lastErr);
   };
-  const p = queue.then(run, run);
-  queue = p.catch(() => {});
+  const enqueue = () => { const p = queue.then(run, run); queue = p.catch(() => {}); return p; };
+  if (bg) { // background extras (related, seasons) only run while no page-critical request is waiting
+    return (async () => { while (fgPending > 0) await sleep(500); return enqueue(); })();
+  }
+  fgPending++;
+  const p = enqueue();
+  p.then(() => { fgPending--; }, () => { fgPending--; });
   return p;
 }
 async function page(vars, fields = MEDIA_LITE) {
@@ -565,13 +571,16 @@ function loadHomeCache() {
 }
 function saveHomeCache(d) { try { localStorage.setItem(HOME_KEY, JSON.stringify({ t: Date.now(), d })); } catch (e) {} }
 
+const HOME_Q = `query($season:MediaSeason,$seasonYear:Int){
+  hero:Page(perPage:6){media(type:ANIME,isAdult:false,sort:[POPULARITY_DESC],status:RELEASING){${MEDIA_HERO}}}
+  latest:Page(perPage:24){media(type:ANIME,isAdult:false,sort:[POPULARITY_DESC],season:$season,seasonYear:$seasonYear){${MEDIA_LITE}}}
+  upcoming:Page(perPage:12){media(type:ANIME,isAdult:false,sort:[POPULARITY_DESC],status:NOT_YET_RELEASED){${MEDIA_LITE}}}}`;
 async function init() {
-  const hero = await page({ status: 'RELEASING', sort: ['POPULARITY_DESC'], perPage: 6 }, MEDIA_HERO);
-  let latest = null;
-  try { latest = await page({ ...currentSeason(), sort: ['POPULARITY_DESC'] }); } catch (e) {  }
-  if (!latest?.data?.length) latest = await page({ status: 'RELEASING', sort: ['SCORE_DESC'], page: 2 }); // fallback: top airing, page 2
-  const upcoming = await page({ status: 'NOT_YET_RELEASED', sort: ['POPULARITY_DESC'], perPage: 12 });
-  state.home = { hero: dedupe(hero.data).slice(0, 6), latest: dedupe(latest.data).slice(0, 16), upcoming: dedupe(upcoming.data).slice(0, 12) };
+  const d = await gql(HOME_Q, currentSeason());
+  const list = (k) => dedupe((d[k]?.media || []).map(norm));
+  let latest = list('latest');
+  if (!latest.length) latest = dedupe((await page({ status: 'RELEASING', sort: ['SCORE_DESC'], page: 2 })).data); // fallback: top airing, page 2
+  state.home = { hero: list('hero').slice(0, 6), latest: latest.slice(0, 16), upcoming: list('upcoming').slice(0, 12) };
   saveHomeCache(state.home);
 }
 // AniKoto publishes a recent feed and series-by-ID endpoint. No title-search endpoint is documented,
@@ -735,7 +744,7 @@ const seasonCache = new Map();
 async function getSeasonChain(id) {
   const key = String(id);
   if (seasonCache.has(key)) return seasonCache.get(key);
-  const fetchOne = async (i) => (await gql(REL_Q, { id: +i })).Media;
+  const fetchOne = async (i) => (await gql(REL_Q, { id: +i }, true)).Media;
   const self = await fetchOne(id);
   const walk = async (start, type, max) => {
     const out = []; let cur = start;
@@ -747,7 +756,7 @@ async function getSeasonChain(id) {
     }
     return out;
   };
-  const [back, fwd] = await Promise.all([walk(self, 'PREQUEL', 5), walk(self, 'SEQUEL', 5)]);
+  const [back, fwd] = await Promise.all([walk(self, 'PREQUEL', 3), walk(self, 'SEQUEL', 3)]);
   const chain = [...back.reverse(), self, ...fwd];
   seasonCache.set(key, chain);
   return chain;
@@ -784,7 +793,7 @@ function miniCard(m, tag) {
 async function loadRelatedSimilar(id) {
   try {
     let data = rsCache.get(String(id));
-    if (!data) { data = (await gql(RS_Q, { id: +id })).Media; rsCache.set(String(id), data); }
+    if (!data) { data = (await gql(RS_Q, { id: +id }, true)).Media; rsCache.set(String(id), data); }
     if (state.view !== 'watch' || String(state.id) !== String(id)) return;
     const rel = (data.relations?.edges || [])
       .filter(e => e.node?.type === 'ANIME')
